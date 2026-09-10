@@ -1240,22 +1240,13 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.R
 		return res, err
 	}
 
-	labelingChanged := false
-	if !r.usesExternalMachineConfigPool() {
-		kataNodeSelector, err := r.getKataConfigNodeSelectorAsSelector()
-		if err != nil {
-			r.Log.Info("Couldn't get node selector for unlabelling nodes", "err", err)
-			return ctrl.Result{Requeue: true}, nil
+	labelingChanged, err := r.unlabelKataNodes()
+	if err != nil {
+		r.Log.Info("Couldn't unlabel Kata nodes", "err", err)
+		if k8serrors.IsConflict(err) {
+			return ctrl.Result{Requeue: true, RequeueAfter: 10 * time.Second}, nil
 		}
-		labelingChanged, err = r.unlabelNodes(kataNodeSelector)
-
-		if err != nil {
-			if k8serrors.IsConflict(err) {
-				return ctrl.Result{Requeue: true, RequeueAfter: 10 * time.Second}, nil
-			} else {
-				return ctrl.Result{Requeue: true}, nil
-			}
-		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	r.Log.Info("Making sure parent MCP is synced properly, SCNodeRole=" + machinePool)
@@ -2085,6 +2076,19 @@ func (r *KataConfigOpenShiftReconciler) unlabelNodes(nodeSelector labels.Selecto
 		}
 	}
 	return labelingChanged, nil
+}
+
+func (r *KataConfigOpenShiftReconciler) unlabelKataNodes() (bool, error) {
+	if r.usesExternalMachineConfigPool() {
+		return false, nil
+	}
+
+	kataNodeSelector, err := r.getKataConfigNodeSelectorAsSelector()
+	if err != nil {
+		return false, fmt.Errorf("failed to get node selector for unlabelling nodes: %w", err)
+	}
+
+	return r.unlabelNodes(kataNodeSelector)
 }
 
 //lint:ignore U1000 This method is unused, but let's keep it for now
