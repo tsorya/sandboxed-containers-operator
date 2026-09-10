@@ -61,7 +61,9 @@ func externalMachineConfigPoolReconciler(t *testing.T, objects ...runtime.Object
 	}
 
 	return &KataConfigOpenShiftReconciler{
-		Client: fake.NewClientBuilder().WithScheme(scheme).WithRuntimeObjects(objects...).Build(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&kataconfigurationv1.KataConfig{}).
+			WithRuntimeObjects(objects...).Build(),
 		Log:    logr.Discard(),
 		Scheme: scheme,
 		kataConfig: &kataconfigurationv1.KataConfig{
@@ -211,6 +213,128 @@ func TestEnsureExternalMachineConfigPool(t *testing.T) {
 		err := r.ensureExternalMachineConfigPool()
 		if err == nil || !strings.Contains(err.Error(), `target MachineConfigPool "worker-dpu"`) {
 			t.Fatalf("expected missing target MCP error, got %v", err)
+		}
+	})
+}
+
+func TestTargetMachineConfigPoolNotFoundCondition(t *testing.T) {
+	t.Run("persists the condition when installation cannot find the pool", func(t *testing.T) {
+		r := externalMachineConfigPoolReconciler(t)
+		if err := r.Create(context.Background(), r.kataConfig); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := r.processKataConfigInstallRequest(); err == nil || !strings.Contains(err.Error(), "not found") {
+			t.Fatalf("expected missing target MCP error, got %v", err)
+		}
+		if condition := r.findInProgressCondition(); condition == nil || condition.Reason != targetMcpNotFoundReason {
+			t.Fatalf("expected in-memory missing target MCP condition, got %#v", condition)
+		}
+
+		stored := &kataconfigurationv1.KataConfig{}
+		if err := r.Get(context.Background(), types.NamespacedName{Name: r.kataConfig.Name}, stored); err != nil {
+			t.Fatal(err)
+		}
+		if len(stored.Status.Conditions) != 1 {
+			t.Fatalf("expected one persisted condition, got %#v", stored.Status.Conditions)
+		}
+		condition := stored.Status.Conditions[0]
+		if condition.Status != corev1.ConditionTrue || condition.Reason != targetMcpNotFoundReason {
+			t.Fatalf("unexpected persisted condition: %#v", condition)
+		}
+	})
+
+	t.Run("records the missing pool and recovers to installing", func(t *testing.T) {
+		r := externalMachineConfigPoolReconciler(t)
+		missingPoolErr := r.ensureExternalMachineConfigPool()
+
+		if changed := r.setInProgressConditionToTargetMcpNotReady("worker-dpu", missingPoolErr); !changed {
+			t.Fatal("expected missing target MCP condition to change")
+		}
+		condition := r.findInProgressCondition()
+		if condition == nil {
+			t.Fatal("expected InProgress condition")
+		}
+		if condition.Status != corev1.ConditionTrue || condition.Reason != targetMcpNotFoundReason {
+			t.Fatalf("unexpected missing target MCP condition: %#v", condition)
+		}
+		if condition.Message != `Target MachineConfigPool "worker-dpu" was not found` {
+			t.Fatalf("unexpected condition message: %q", condition.Message)
+		}
+		if changed := r.setInProgressConditionToTargetMcpNotReady("worker-dpu", missingPoolErr); changed {
+			t.Fatal("expected an unchanged condition to avoid another status update")
+		}
+
+		if changed := r.recoverFromTargetMcpFailure(); !changed {
+			t.Fatal("expected target MCP recovery to change the condition")
+		}
+		if condition.Status != corev1.ConditionTrue || condition.Reason != "Installing" {
+			t.Fatalf("unexpected recovered condition: %#v", condition)
+		}
+	})
+
+	t.Run("replaces not found when the pool returns but is not ready", func(t *testing.T) {
+		missingPoolReconciler := externalMachineConfigPoolReconciler(t)
+		missingPoolErr := missingPoolReconciler.ensureExternalMachineConfigPool()
+		if changed := missingPoolReconciler.setInProgressConditionToTargetMcpNotReady("worker-dpu", missingPoolErr); !changed {
+			t.Fatal("expected missing target MCP condition to change")
+		}
+
+		pausedMcp := externalMachineConfigPool("worker-dpu")
+		pausedMcp.Spec.Paused = true
+		pausedPoolReconciler := externalMachineConfigPoolReconciler(t, pausedMcp)
+		pausedPoolReconciler.kataConfig.Status = missingPoolReconciler.kataConfig.Status
+		pausedPoolErr := pausedPoolReconciler.ensureExternalMachineConfigPool()
+		if changed := pausedPoolReconciler.setInProgressConditionToTargetMcpNotReady("worker-dpu", pausedPoolErr); !changed {
+			t.Fatal("expected target MCP condition to change from not found to not ready")
+		}
+
+		condition := pausedPoolReconciler.findInProgressCondition()
+		if condition.Reason != targetMcpNotReadyReason || !strings.Contains(condition.Message, "paused") {
+			t.Fatalf("unexpected not-ready condition: %#v", condition)
+		}
+	})
+
+	t.Run("persists recovery when the pool returns", func(t *testing.T) {
+		t.Setenv("SANDBOXED_CONTAINERS_EXTENSION", "sandboxed-containers")
+		mcp := externalMachineConfigPool("worker-dpu")
+		r := externalMachineConfigPoolReconciler(t, mcp)
+		if err := r.Create(context.Background(), r.kataConfig); err != nil {
+			t.Fatal(err)
+		}
+
+		missingPoolErr := externalMachineConfigPoolReconciler(t).ensureExternalMachineConfigPool()
+		r.setInProgressConditionToTargetMcpNotReady("worker-dpu", missingPoolErr)
+		if err := r.Status().Update(context.Background(), r.kataConfig); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := r.processKataConfigInstallRequest(); err != nil {
+			t.Fatalf("unexpected installation error after target MCP recovery: %v", err)
+		}
+
+		stored := &kataconfigurationv1.KataConfig{}
+		if err := r.Get(context.Background(), types.NamespacedName{Name: r.kataConfig.Name}, stored); err != nil {
+			t.Fatal(err)
+		}
+		if len(stored.Status.Conditions) != 1 || stored.Status.Conditions[0].Reason != "Installing" {
+			t.Fatalf("unexpected persisted recovery condition: %#v", stored.Status.Conditions)
+		}
+	})
+
+	t.Run("does not overwrite an unrelated failure", func(t *testing.T) {
+		r := externalMachineConfigPoolReconciler(t)
+		r.kataConfig.Status.Conditions = []kataconfigurationv1.KataConfigCondition{{
+			Type:   kataconfigurationv1.KataConfigInProgress,
+			Status: corev1.ConditionTrue,
+			Reason: "Failed",
+		}}
+
+		if changed := r.recoverFromTargetMcpFailure(); changed {
+			t.Fatal("expected unrelated condition to remain unchanged")
+		}
+		if condition := r.findInProgressCondition(); condition.Reason != "Failed" {
+			t.Fatalf("unexpected condition after recovery check: %#v", condition)
 		}
 	})
 }

@@ -1439,7 +1439,17 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigInstallRequest() (ctrl.
 	if usesExternalMachineConfigPool {
 		if err := r.ensureExternalMachineConfigPool(); err != nil {
 			r.Log.Error(err, "Target MachineConfigPool is not ready for Kata installation", "machinePool", machinePool)
+			if r.setInProgressConditionToTargetMcpNotReady(machinePool, err) {
+				if statusErr := r.Client.Status().Update(context.TODO(), r.kataConfig); statusErr != nil {
+					return ctrl.Result{Requeue: true}, fmt.Errorf("failed to record target MachineConfigPool failure: %w", statusErr)
+				}
+			}
 			return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
+		}
+		if r.recoverFromTargetMcpFailure() {
+			if err := r.Client.Status().Update(context.TODO(), r.kataConfig); err != nil {
+				return ctrl.Result{Requeue: true}, fmt.Errorf("failed to record target MachineConfigPool recovery: %w", err)
+			}
 		}
 	}
 
@@ -2395,6 +2405,44 @@ func (r *KataConfigOpenShiftReconciler) setInProgressConditionToUpdating() {
 	cond.Message = "Adding and/or removing kata-enabled nodes"
 
 	r.Log.Info("InProgress Condition set to Updating")
+}
+
+const (
+	targetMcpNotFoundReason = "TargetMachineConfigPoolNotFound"
+	targetMcpNotReadyReason = "TargetMachineConfigPoolNotReady"
+)
+
+func (r *KataConfigOpenShiftReconciler) setInProgressConditionToTargetMcpNotReady(machinePool string, err error) bool {
+	reason := targetMcpNotReadyReason
+	message := fmt.Sprintf("Target MachineConfigPool %q is not ready: %v", machinePool, err)
+	if k8serrors.IsNotFound(err) {
+		reason = targetMcpNotFoundReason
+		message = fmt.Sprintf("Target MachineConfigPool %q was not found", machinePool)
+	}
+
+	cond := r.findInProgressCondition()
+	if cond != nil && cond.Status == corev1.ConditionTrue && cond.Reason == reason && cond.Message == message {
+		return false
+	}
+
+	cond = r.retrieveInProgressConditionForChange()
+	cond.Status = corev1.ConditionTrue
+	cond.Reason = reason
+	cond.Message = message
+
+	r.Log.Info("InProgress Condition set for target MachineConfigPool failure", "machinePool", machinePool, "reason", reason)
+	return true
+}
+
+func (r *KataConfigOpenShiftReconciler) recoverFromTargetMcpFailure() bool {
+	cond := r.findInProgressCondition()
+	if cond == nil || cond.Status != corev1.ConditionTrue ||
+		(cond.Reason != targetMcpNotFoundReason && cond.Reason != targetMcpNotReadyReason) {
+		return false
+	}
+
+	r.setInProgressConditionToInstalling()
+	return true
 }
 
 func (r *KataConfigOpenShiftReconciler) setInProgressConditionToFailed(failingNode *corev1.Node) {
