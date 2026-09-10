@@ -1228,6 +1228,25 @@ func (r *KataConfigOpenShiftReconciler) isMcpConvergedAtKataState(mcpName string
 	return machineConfigPoolIncludesKataMachineConfig(mcp) == enabled, nil
 }
 
+func (r *KataConfigOpenShiftReconciler) shouldWaitForMcoToStart(mcpName string, isMcoUpdating, kataEnabled bool) (bool, error) {
+	if isMcoUpdating {
+		return false, nil
+	}
+
+	if r.usesExternalMachineConfigPool() {
+		atExpectedState, err := r.isMcpConvergedAtKataState(mcpName, kataEnabled)
+		if k8serrors.IsNotFound(err) && !kataEnabled {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return !atExpectedState, nil
+	}
+
+	return r.kataConfig.Status.WaitingForMcoToStart, nil
+}
+
 func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.Result, error) {
 	r.Log.Info("KataConfig deletion in progress: ")
 	machinePool, err := r.getMcpName()
@@ -1312,26 +1331,16 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.R
 	}
 	isMcoUpdating := r.isMcpUpdating(targetPool)
 
-	if r.usesExternalMachineConfigPool() && !isMcoUpdating {
-		atExpectedState, stateErr := r.isMcpConvergedAtKataState(targetPool, false)
-		if k8serrors.IsNotFound(stateErr) {
-			r.kataConfig.Status.WaitingForMcoToStart = false
-		} else if stateErr != nil {
-			return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, stateErr
-		} else if !atExpectedState {
-			r.kataConfig.Status.WaitingForMcoToStart = true
-			return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, nil
-		} else {
-			r.kataConfig.Status.WaitingForMcoToStart = false
-		}
+	shouldWaitForMco, err := r.shouldWaitForMcoToStart(targetPool, isMcoUpdating, false)
+	if err != nil {
+		return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
 	}
-	if !r.usesExternalMachineConfigPool() && !isMcoUpdating && r.kataConfig.Status.WaitingForMcoToStart {
+	r.kataConfig.Status.WaitingForMcoToStart = shouldWaitForMco
+	if shouldWaitForMco {
 		r.Log.Info("Waiting for MCO to start updating.")
 		return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, nil
-	} else {
-		r.Log.Info("No need to wait for MCO to start updating.", "isMcoUpdating", isMcoUpdating, "Status.WaitingForMcoToStart", r.kataConfig.Status.WaitingForMcoToStart)
-		r.kataConfig.Status.WaitingForMcoToStart = false
 	}
+	r.Log.Info("No need to wait for MCO to start updating.", "isMcoUpdating", isMcoUpdating, "Status.WaitingForMcoToStart", r.kataConfig.Status.WaitingForMcoToStart)
 
 	err = r.updateStatus()
 	if err != nil {
@@ -1518,24 +1527,16 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigInstallRequest() (ctrl.
 	//     The MCO isn't updating nor do we think it should be.  This is
 	//     the case e.g. when we're reconciliating a KataConfig change
 	//     that doesn't affect kata installation on cluster.
-	if usesExternalMachineConfigPool && !isMcoUpdating {
-		atExpectedState, stateErr := r.isMcpConvergedAtKataState(machinePool, true)
-		if stateErr != nil {
-			return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, stateErr
-		}
-		if !atExpectedState {
-			r.kataConfig.Status.WaitingForMcoToStart = true
-			return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, nil
-		}
-		r.kataConfig.Status.WaitingForMcoToStart = false
+	shouldWaitForMco, err := r.shouldWaitForMcoToStart(machinePool, isMcoUpdating, true)
+	if err != nil {
+		return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
 	}
-	if !usesExternalMachineConfigPool && !isMcoUpdating && r.kataConfig.Status.WaitingForMcoToStart {
+	r.kataConfig.Status.WaitingForMcoToStart = shouldWaitForMco
+	if shouldWaitForMco {
 		r.Log.Info("Waiting for MCO to start updating.")
 		return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, nil
-	} else {
-		r.Log.Info("No need to wait for MCO to start updating.", "isMcoUpdating", isMcoUpdating, "Status.WaitingForMcoToStart", r.kataConfig.Status.WaitingForMcoToStart)
-		r.kataConfig.Status.WaitingForMcoToStart = false
 	}
+	r.Log.Info("No need to wait for MCO to start updating.", "isMcoUpdating", isMcoUpdating, "Status.WaitingForMcoToStart", r.kataConfig.Status.WaitingForMcoToStart)
 
 	err = r.updateStatus()
 	if err != nil {
