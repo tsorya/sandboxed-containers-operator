@@ -39,7 +39,7 @@ func externalMachineConfigPool(name string) *mcfgv1.MachineConfigPool {
 				}},
 			},
 			NodeSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{nodeRoleLabel(name): ""},
+				MatchLabels: map[string]string{nodeRoleLabelPrefix + name: ""},
 			},
 			Paused: false,
 		},

@@ -86,6 +86,8 @@ const (
 	extension_mc_name             = "50-enable-sandboxed-containers-extension"
 	defaultKataMCPName            = "kata-oc"
 	externalMCPSelectorLabel      = "kataconfiguration.openshift.io/target-kataconfig"
+	machineConfigPoolLabelPrefix  = "pools.operator.machineconfiguration.openshift.io/"
+	nodeRoleLabelPrefix           = "node-role.kubernetes.io/"
 	KataAddonConfigMapName        = "kata-addon-artifacts"
 	// Use same Pod Overhead as upstream kata-deploy using, see
 	// https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/runtimeclasses/kata-qemu.yaml#L7
@@ -555,7 +557,7 @@ func (r *KataConfigOpenShiftReconciler) newMCPforCR() *mcfgv1.MachineConfigPool 
 				// ContainerRuntimeConfig resource which selects MCPs based
 				// on labels and is used to implement KataConfig.spec.logLevel
 				// handling.
-				machineConfigPoolSelectorLabel(defaultKataMCPName): "",
+				machineConfigPoolLabelPrefix + defaultKataMCPName: "",
 			},
 		},
 
@@ -829,19 +831,11 @@ func (r *KataConfigOpenShiftReconciler) checkNodeEligibility() error {
 	return nil
 }
 
-func machineConfigPoolSelectorLabel(machinePool string) string {
-	return "pools.operator.machineconfiguration.openshift.io/" + machinePool
-}
-
-func nodeRoleLabel(machinePool string) string {
-	return "node-role.kubernetes.io/" + machinePool
-}
-
 func (r *KataConfigOpenShiftReconciler) machineConfigPoolSelectorLabels(machinePool string) map[string]string {
 	if r.usesExternalMachineConfigPool() {
 		return map[string]string{externalMCPSelectorLabel: r.kataConfig.Name}
 	}
-	return map[string]string{machineConfigPoolSelectorLabel(machinePool): ""}
+	return map[string]string{machineConfigPoolLabelPrefix + machinePool: ""}
 }
 
 func (r *KataConfigOpenShiftReconciler) usesExternalMachineConfigPool() bool {
@@ -898,7 +892,7 @@ func (r *KataConfigOpenShiftReconciler) ensureExternalMachineConfigPool() error 
 		return fmt.Errorf("target MachineConfigPool %q does not select MachineConfigs with role %q", machinePool, machinePool)
 	}
 
-	roleLabel := nodeRoleLabel(machinePool)
+	roleLabel := nodeRoleLabelPrefix + machinePool
 	if mcp.Spec.NodeSelector == nil {
 		return fmt.Errorf("target MachineConfigPool %q must select nodes with label %q", machinePool, roleLabel)
 	}
@@ -1183,7 +1177,7 @@ func (r *KataConfigOpenShiftReconciler) getKataConfigNodeSelectorAsSelector() (l
 // KataConfig.spec.kataConfigPoolSelector.
 func (r *KataConfigOpenShiftReconciler) getNodeSelectorAsMap() map[string]string {
 	if r.usesExternalMachineConfigPool() {
-		return map[string]string{nodeRoleLabel(r.kataConfig.Spec.TargetMachineConfigPool): ""}
+		return map[string]string{nodeRoleLabelPrefix + r.kataConfig.Spec.TargetMachineConfigPool: ""}
 	}
 
 	isConvergedCluster, err := r.checkConvergedCluster()
@@ -1191,7 +1185,7 @@ func (r *KataConfigOpenShiftReconciler) getNodeSelectorAsMap() map[string]string
 		// master MCP cannot be customized
 		return map[string]string{"node-role.kubernetes.io/master": ""}
 	} else {
-		return map[string]string{nodeRoleLabel(defaultKataMCPName): ""}
+		return map[string]string{nodeRoleLabelPrefix + defaultKataMCPName: ""}
 	}
 }
 
