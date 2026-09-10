@@ -84,6 +84,10 @@ const (
 	DashboardConfigMapNamespace   = "openshift-config-managed"
 	container_runtime_config_name = "kata-crio-config"
 	extension_mc_name             = "50-enable-sandboxed-containers-extension"
+	defaultKataMCPName            = "kata-oc"
+	externalMCPSelectorLabel      = "kataconfiguration.openshift.io/target-kataconfig"
+	machineConfigPoolLabelPrefix  = "pools.operator.machineconfiguration.openshift.io/"
+	nodeRoleLabelPrefix           = "node-role.kubernetes.io/"
 	KataAddonConfigMapName        = "kata-addon-artifacts"
 	// Use same Pod Overhead as upstream kata-deploy using, see
 	// https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/runtimeclasses/kata-qemu.yaml#L7
@@ -168,6 +172,9 @@ func (r *KataConfigOpenShiftReconciler) Reconcile(ctx context.Context, req ctrl.
 	if err != nil {
 		r.Log.Info("Unable to process feature gates", "err", err)
 		return ctrl.Result{}, err
+	}
+	if r.kataConfig.Spec.TargetMachineConfigPool != "" && r.DeploymentMode != MachineConfigMode {
+		return ctrl.Result{}, fmt.Errorf("spec.targetMachineConfigPool requires MachineConfig deployment mode")
 	}
 
 	return func() (ctrl.Result, error) {
@@ -332,11 +339,11 @@ func (r *KataConfigOpenShiftReconciler) processLogLevel(desiredLogLevel string) 
 			return nil
 		}
 
-		machineConfigPoolSelectorLabels := map[string]string{"pools.operator.machineconfiguration.openshift.io/kata-oc": ""}
-		isConvergedCluster, err := r.checkConvergedCluster()
-		if isConvergedCluster && err == nil {
-			machineConfigPoolSelectorLabels = map[string]string{"pools.operator.machineconfiguration.openshift.io/master": ""}
+		machinePool, err := r.getMcpName()
+		if err != nil {
+			return err
 		}
+		machineConfigPoolSelectorLabels := r.machineConfigPoolSelectorLabels(machinePool)
 
 		machineConfigPoolSelector := &metav1.LabelSelector{
 			MatchLabels: machineConfigPoolSelectorLabels,
@@ -534,7 +541,7 @@ func (r *KataConfigOpenShiftReconciler) newMCPforCR() *mcfgv1.MachineConfigPool 
 	lsr := metav1.LabelSelectorRequirement{
 		Key:      "machineconfiguration.openshift.io/role",
 		Operator: metav1.LabelSelectorOpIn,
-		Values:   []string{"kata-oc", "worker"},
+		Values:   []string{defaultKataMCPName, "worker"},
 	}
 
 	mcp := &mcfgv1.MachineConfigPool{
@@ -543,14 +550,14 @@ func (r *KataConfigOpenShiftReconciler) newMCPforCR() *mcfgv1.MachineConfigPool 
 			Kind:       "MachineConfigPool",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name: "kata-oc",
+			Name: defaultKataMCPName,
 			Labels: map[string]string{
 				// This label is added to make it possible to form a label
 				// selector that selects this MCP.  One use case is the
 				// ContainerRuntimeConfig resource which selects MCPs based
 				// on labels and is used to implement KataConfig.spec.logLevel
 				// handling.
-				"pools.operator.machineconfiguration.openshift.io/kata-oc": "",
+				machineConfigPoolLabelPrefix + defaultKataMCPName: "",
 			},
 		},
 
@@ -824,7 +831,22 @@ func (r *KataConfigOpenShiftReconciler) checkNodeEligibility() error {
 	return nil
 }
 
+func (r *KataConfigOpenShiftReconciler) machineConfigPoolSelectorLabels(machinePool string) map[string]string {
+	if r.usesExternalMachineConfigPool() {
+		return map[string]string{externalMCPSelectorLabel: r.kataConfig.Name}
+	}
+	return map[string]string{machineConfigPoolLabelPrefix + machinePool: ""}
+}
+
+func (r *KataConfigOpenShiftReconciler) usesExternalMachineConfigPool() bool {
+	return r.kataConfig != nil && r.kataConfig.Spec.TargetMachineConfigPool != ""
+}
+
 func (r *KataConfigOpenShiftReconciler) getMcpName() (string, error) {
+	if r.usesExternalMachineConfigPool() {
+		return r.kataConfig.Spec.TargetMachineConfigPool, nil
+	}
+
 	isConvergedCluster, err := r.checkConvergedCluster()
 	if err != nil {
 		r.Log.Info("Error trying to find out if cluster is converged", "err", err)
@@ -833,8 +855,94 @@ func (r *KataConfigOpenShiftReconciler) getMcpName() (string, error) {
 	if isConvergedCluster {
 		return "master", nil
 	} else {
-		return "kata-oc", nil
+		return defaultKataMCPName, nil
 	}
+}
+
+// ensureExternalMachineConfigPool verifies the contract needed to install Kata
+// on an externally managed pool. It never changes the pool spec. It adds only
+// an OSC-owned metadata label needed by ContainerRuntimeConfig, which can
+// select pools only by label rather than by name.
+func (r *KataConfigOpenShiftReconciler) ensureExternalMachineConfigPool() error {
+	if !r.usesExternalMachineConfigPool() {
+		return nil
+	}
+
+	machinePool := r.kataConfig.Spec.TargetMachineConfigPool
+	mcp, err := r.getMcpByName(machinePool)
+	if err != nil {
+		return fmt.Errorf("failed to get target MachineConfigPool %q: %w", machinePool, err)
+	}
+	if r.kataConfig.Spec.CheckNodeEligibility {
+		return fmt.Errorf("spec.targetMachineConfigPool cannot be combined with spec.checkNodeEligibility")
+	}
+	if r.kataConfig.Spec.KataConfigPoolSelector != nil {
+		return fmt.Errorf("spec.targetMachineConfigPool cannot be combined with spec.kataConfigPoolSelector")
+	}
+	if mcp.Spec.Paused {
+		return fmt.Errorf("target MachineConfigPool %q is paused", machinePool)
+	}
+
+	machineConfigSelector, err := metav1.LabelSelectorAsSelector(mcp.Spec.MachineConfigSelector)
+	if err != nil {
+		return fmt.Errorf("target MachineConfigPool %q has an invalid MachineConfig selector: %w", machinePool, err)
+	}
+	machineConfigLabels := labels.Set{"machineconfiguration.openshift.io/role": machinePool}
+	if !machineConfigSelector.Matches(machineConfigLabels) {
+		return fmt.Errorf("target MachineConfigPool %q does not select MachineConfigs with role %q", machinePool, machinePool)
+	}
+
+	roleLabel := nodeRoleLabelPrefix + machinePool
+	if mcp.Spec.NodeSelector == nil {
+		return fmt.Errorf("target MachineConfigPool %q must select nodes with label %q", machinePool, roleLabel)
+	}
+	if value, ok := mcp.Spec.NodeSelector.MatchLabels[roleLabel]; !ok || value != "" {
+		return fmt.Errorf("target MachineConfigPool %q must select nodes with label %q", machinePool, roleLabel)
+	}
+
+	if value, ok := mcp.Labels[externalMCPSelectorLabel]; ok {
+		if value == r.kataConfig.Name {
+			return nil
+		}
+		return fmt.Errorf("target MachineConfigPool %q has label %q owned by %q", machinePool, externalMCPSelectorLabel, value)
+	}
+
+	original := mcp.DeepCopy()
+	if mcp.Labels == nil {
+		mcp.Labels = map[string]string{}
+	}
+	mcp.Labels[externalMCPSelectorLabel] = r.kataConfig.Name
+	if err := r.Patch(context.TODO(), mcp, client.MergeFrom(original)); err != nil {
+		return fmt.Errorf("failed to add selector label to target MachineConfigPool %q: %w", machinePool, err)
+	}
+
+	return nil
+}
+
+func (r *KataConfigOpenShiftReconciler) removeExternalMachineConfigPoolSelectorLabel() error {
+	if !r.usesExternalMachineConfigPool() {
+		return nil
+	}
+
+	machinePool := r.kataConfig.Spec.TargetMachineConfigPool
+	mcp, err := r.getMcpByName(machinePool)
+	if k8serrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("failed to get target MachineConfigPool %q: %w", machinePool, err)
+	}
+	if value, ok := mcp.Labels[externalMCPSelectorLabel]; !ok || value != r.kataConfig.Name {
+		return nil
+	}
+
+	original := mcp.DeepCopy()
+	delete(mcp.Labels, externalMCPSelectorLabel)
+	if err := r.Patch(context.TODO(), mcp, client.MergeFrom(original)); err != nil {
+		return fmt.Errorf("failed to remove selector label from target MachineConfigPool %q: %w", machinePool, err)
+	}
+
+	return nil
 }
 
 func (r *KataConfigOpenShiftReconciler) createScc() error {
@@ -1031,6 +1139,9 @@ func (r *KataConfigOpenShiftReconciler) deleteRuntimeClass(runtimeClassName stri
 // functions refers to the value of KataConfig.spec.kataConfigPoolSelector,
 // i.e. the original selector supplied by the user of KataConfig.
 func (r *KataConfigOpenShiftReconciler) getKataConfigNodeSelectorAsLabelSelector() *metav1.LabelSelector {
+	if r.usesExternalMachineConfigPool() {
+		return &metav1.LabelSelector{MatchLabels: r.getNodeSelectorAsMap()}
+	}
 
 	isConvergedCluster, err := r.checkConvergedCluster()
 	if err == nil && isConvergedCluster {
@@ -1065,13 +1176,16 @@ func (r *KataConfigOpenShiftReconciler) getKataConfigNodeSelectorAsSelector() (l
 // MatchExpressions and thus cannot hold the full value of
 // KataConfig.spec.kataConfigPoolSelector.
 func (r *KataConfigOpenShiftReconciler) getNodeSelectorAsMap() map[string]string {
+	if r.usesExternalMachineConfigPool() {
+		return map[string]string{nodeRoleLabelPrefix + r.kataConfig.Spec.TargetMachineConfigPool: ""}
+	}
 
 	isConvergedCluster, err := r.checkConvergedCluster()
 	if err == nil && isConvergedCluster {
 		// master MCP cannot be customized
 		return map[string]string{"node-role.kubernetes.io/master": ""}
 	} else {
-		return map[string]string{"node-role.kubernetes.io/kata-oc": ""}
+		return map[string]string{nodeRoleLabelPrefix + defaultKataMCPName: ""}
 	}
 }
 
@@ -1089,6 +1203,50 @@ func (r *KataConfigOpenShiftReconciler) isMcpUpdating(mcpName string) bool {
 	return apihelpers.IsMachineConfigPoolConditionTrue(mcp.Status.Conditions, mcfgv1.MachineConfigPoolUpdating)
 }
 
+func machineConfigPoolIncludesKataMachineConfig(mcp *mcfgv1.MachineConfigPool) bool {
+	for _, source := range mcp.Spec.Configuration.Source {
+		if source.Name == extension_mc_name || source.Name == image_mc_name {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *KataConfigOpenShiftReconciler) isMcpConvergedAtKataState(mcpName string, enabled bool) (bool, error) {
+	mcp, err := r.getMcpByName(mcpName)
+	if err != nil {
+		return false, err
+	}
+	if !apihelpers.IsMachineConfigPoolConditionTrue(mcp.Status.Conditions, mcfgv1.MachineConfigPoolUpdated) ||
+		mcp.Status.Configuration.Name != mcp.Spec.Configuration.Name ||
+		mcp.Status.UpdatedMachineCount != mcp.Status.MachineCount ||
+		mcp.Status.ReadyMachineCount != mcp.Status.MachineCount ||
+		mcp.Status.UnavailableMachineCount != 0 ||
+		mcp.Status.DegradedMachineCount != 0 {
+		return false, nil
+	}
+	return machineConfigPoolIncludesKataMachineConfig(mcp) == enabled, nil
+}
+
+func (r *KataConfigOpenShiftReconciler) shouldWaitForMcoToStart(mcpName string, isMcoUpdating, kataEnabled bool) (bool, error) {
+	if isMcoUpdating {
+		return false, nil
+	}
+
+	if r.usesExternalMachineConfigPool() {
+		atExpectedState, err := r.isMcpConvergedAtKataState(mcpName, kataEnabled)
+		if k8serrors.IsNotFound(err) && !kataEnabled {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return !atExpectedState, nil
+	}
+
+	return r.kataConfig.Status.WaitingForMcoToStart, nil
+}
+
 func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.Result, error) {
 	r.Log.Info("KataConfig deletion in progress: ")
 	machinePool, err := r.getMcpName()
@@ -1101,19 +1259,13 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.R
 		return res, err
 	}
 
-	kataNodeSelector, err := r.getKataConfigNodeSelectorAsSelector()
+	labelingChanged, err := r.unlabelKataNodes()
 	if err != nil {
-		r.Log.Info("Couldn't get node selector for unlabelling nodes", "err", err)
-		return ctrl.Result{Requeue: true}, nil
-	}
-	labelingChanged, err := r.unlabelNodes(kataNodeSelector)
-
-	if err != nil {
+		r.Log.Info("Couldn't unlabel Kata nodes", "err", err)
 		if k8serrors.IsConflict(err) {
 			return ctrl.Result{Requeue: true, RequeueAfter: 10 * time.Second}, nil
-		} else {
-			return ctrl.Result{Requeue: true}, nil
 		}
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	r.Log.Info("Making sure parent MCP is synced properly, SCNodeRole=" + machinePool)
@@ -1144,7 +1296,10 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.R
 		}
 	}
 
-	isConvergedCluster, _ := r.checkConvergedCluster()
+	isConvergedCluster := false
+	if !r.usesExternalMachineConfigPool() {
+		isConvergedCluster, _ = r.checkConvergedCluster()
+	}
 
 	// Conditions to detect whether we need to wait for the MCO to start
 	// reconciliation differ based on whether the cluster is converged.
@@ -1153,7 +1308,8 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.R
 	// we're deleting a KataConfig on a cluster where no nodes matched the
 	// kataConfigPoolSelector and thus there will be no change for the MCO
 	// to reconciliate).
-	if (isConvergedCluster && !isMcDeleted) || (!isConvergedCluster && labelingChanged) {
+	if ((isConvergedCluster || r.usesExternalMachineConfigPool()) && !isMcDeleted) ||
+		(!isConvergedCluster && !r.usesExternalMachineConfigPool() && labelingChanged) {
 		r.Log.Info("Starting to wait for MCO to start reconciliation")
 		r.kataConfig.Status.WaitingForMcoToStart = true
 	}
@@ -1164,23 +1320,27 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.R
 	// part and the target pool is what we need to watch to find out when
 	// the operation is finished.  When uninstalling kata on a regular
 	// cluster nodes leave "kata-oc" to rejoin "worker" so "worker" is our
-	// target pool.  On a converged cluster, nodes leave "master" to rejoin
-	// it so "master" is both source and target in this case.
+	// target pool. On a converged cluster, nodes leave "master" to rejoin
+	// it so "master" is both source and target. With an externally managed
+	// pool nodes do not migrate, so that same pool is the target.
 	targetPool := "worker"
 	if isConvergedCluster {
 		targetPool = "master"
+	} else if r.usesExternalMachineConfigPool() {
+		targetPool = machinePool
 	}
 	isMcoUpdating := r.isMcpUpdating(targetPool)
 
-	if !isMcoUpdating && r.kataConfig.Status.WaitingForMcoToStart {
-		r.Log.Info("Waiting for MCO to start updating.")
-		// We don't requeue, an MCP going Updated->Updating will
-		// trigger reconciliation by itself thanks to our watching MCPs.
-		return reconcile.Result{}, nil
-	} else {
-		r.Log.Info("No need to wait for MCO to start updating.", "isMcoUpdating", isMcoUpdating, "Status.WaitingForMcoToStart", r.kataConfig.Status.WaitingForMcoToStart)
-		r.kataConfig.Status.WaitingForMcoToStart = false
+	shouldWaitForMco, err := r.shouldWaitForMcoToStart(targetPool, isMcoUpdating, false)
+	if err != nil {
+		return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
 	}
+	r.kataConfig.Status.WaitingForMcoToStart = shouldWaitForMco
+	if shouldWaitForMco {
+		r.Log.Info("Waiting for MCO to start updating.")
+		return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, nil
+	}
+	r.Log.Info("No need to wait for MCO to start updating.", "isMcoUpdating", isMcoUpdating, "Status.WaitingForMcoToStart", r.kataConfig.Status.WaitingForMcoToStart)
 
 	err = r.updateStatus()
 	if err != nil {
@@ -1194,7 +1354,7 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.R
 
 	r.resetInProgressCondition()
 
-	if !isConvergedCluster {
+	if !isConvergedCluster && !r.usesExternalMachineConfigPool() {
 		r.Log.Info("Get()'ing MachineConfigPool to delete it", "machinePool", "kata-oc")
 		kataOcMcp := &mcfgv1.MachineConfigPool{}
 		err = r.Client.Get(context.TODO(), types.NamespacedName{Name: "kata-oc"}, kataOcMcp)
@@ -1234,6 +1394,9 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigDeleteRequest() (ctrl.R
 	if err != nil {
 		return ctrl.Result{Requeue: true}, nil
 	}
+	if err := r.removeExternalMachineConfigPoolSelectorLabel(); err != nil {
+		return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
+	}
 
 	r.Log.Info("Uninstallation completed. Proceeding with the KataConfig deletion")
 	if err = r.removeFinalizer(); err != nil {
@@ -1263,7 +1426,8 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigInstallRequest() (ctrl.
 		return ctrl.Result{}, err
 	}
 
-	isConvergedCluster := machinePool == "master"
+	usesExternalMachineConfigPool := r.usesExternalMachineConfigPool()
+	isConvergedCluster := !usesExternalMachineConfigPool && machinePool == "master"
 
 	// Add finalizer for this CR
 	if !contains(r.kataConfig.GetFinalizers(), kataConfigFinalizer) {
@@ -1272,23 +1436,40 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigInstallRequest() (ctrl.
 		}
 		r.Log.Info("SCNodeRole is: " + machinePool)
 	}
+	if usesExternalMachineConfigPool {
+		if err := r.ensureExternalMachineConfigPool(); err != nil {
+			r.Log.Error(err, "Target MachineConfigPool is not ready for Kata installation", "machinePool", machinePool)
+			if r.setInProgressConditionToTargetMcpNotReady(machinePool, err) {
+				if statusErr := r.Client.Status().Update(context.TODO(), r.kataConfig); statusErr != nil {
+					return ctrl.Result{Requeue: true}, fmt.Errorf("failed to record target MachineConfigPool failure: %w", statusErr)
+				}
+			}
+			return ctrl.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
+		}
+		if r.recoverFromTargetMcpFailure() {
+			if err := r.Client.Status().Update(context.TODO(), r.kataConfig); err != nil {
+				return ctrl.Result{Requeue: true}, fmt.Errorf("failed to record target MachineConfigPool recovery: %w", err)
+			}
+		}
+	}
 
 	customKernelCfg, err := r.getCustomKernelConfig(context.TODO())
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	wasMcJustCreated, err := r.createMc(machinePool, customKernelCfg)
+	mcChanged, err := r.createMc(machinePool, customKernelCfg)
 	if err != nil {
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	if wasMcJustCreated {
+	if mcChanged {
 		r.setInProgressConditionToInstalling()
 	}
 
-	// Create kata-oc MCP only if it's not a converged cluster
-	if !isConvergedCluster {
+	// Create kata-oc MCP only if it's not a converged cluster and no existing
+	// externally managed pool was requested.
+	if !isConvergedCluster && !usesExternalMachineConfigPool {
 		labelingChanged, err := r.updateNodeLabels()
 		if err != nil {
 			if k8serrors.IsConflict(err) {
@@ -1328,7 +1509,7 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigInstallRequest() (ctrl.
 			return ctrl.Result{}, err
 		}
 	} else {
-		if wasMcJustCreated {
+		if mcChanged {
 			r.kataConfig.Status.WaitingForMcoToStart = true
 		}
 	}
@@ -1356,15 +1537,16 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigInstallRequest() (ctrl.
 	//     The MCO isn't updating nor do we think it should be.  This is
 	//     the case e.g. when we're reconciliating a KataConfig change
 	//     that doesn't affect kata installation on cluster.
-	if !isMcoUpdating && r.kataConfig.Status.WaitingForMcoToStart {
-		r.Log.Info("Waiting for MCO to start updating.")
-		// We don't requeue, an MCP going Updated->Updating will
-		// trigger reconciliation by itself thanks to our watching MCPs.
-		return reconcile.Result{}, nil
-	} else {
-		r.Log.Info("No need to wait for MCO to start updating.", "isMcoUpdating", isMcoUpdating, "Status.WaitingForMcoToStart", r.kataConfig.Status.WaitingForMcoToStart)
-		r.kataConfig.Status.WaitingForMcoToStart = false
+	shouldWaitForMco, err := r.shouldWaitForMcoToStart(machinePool, isMcoUpdating, true)
+	if err != nil {
+		return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, err
 	}
+	r.kataConfig.Status.WaitingForMcoToStart = shouldWaitForMco
+	if shouldWaitForMco {
+		r.Log.Info("Waiting for MCO to start updating.")
+		return reconcile.Result{Requeue: true, RequeueAfter: 15 * time.Second}, nil
+	}
+	r.Log.Info("No need to wait for MCO to start updating.", "isMcoUpdating", isMcoUpdating, "Status.WaitingForMcoToStart", r.kataConfig.Status.WaitingForMcoToStart)
 
 	err = r.updateStatus()
 	if err != nil {
@@ -1389,9 +1571,8 @@ func (r *KataConfigOpenShiftReconciler) processKataConfigInstallRequest() (ctrl.
 	return ctrl.Result{}, nil
 }
 
-// If the first return value is 'true' it means that the MC was just created
-// by this call, 'false' means that it's already existed.  As usual, the first
-// return value is only valid if the second one is nil.
+// The first return value reports whether this call created or updated the
+// MachineConfig. It is only valid if the second return value is nil.
 func (r *KataConfigOpenShiftReconciler) createMc(machinePool string, customKernelCfg *customKernelConfig) (bool, error) {
 
 	// In case we're returning an error we want to make it explicit that
@@ -1422,18 +1603,26 @@ func (r *KataConfigOpenShiftReconciler) createMc(machinePool string, customKerne
 	} else if err != nil {
 		r.Log.Info("failed to retrieve MachineConfig", "err", err)
 		return dummy, err
-	} else if !reflect.DeepEqual(existingMc.Spec, mc.Spec) {
-		r.Log.Info("MachineConfig spec changed, updating", "mc.Name", mc.Name)
+	}
+
+	reconciledLabels := maps.Clone(existingMc.Labels)
+	if reconciledLabels == nil {
+		reconciledLabels = map[string]string{}
+	}
+	maps.Copy(reconciledLabels, mc.Labels)
+	if !reflect.DeepEqual(existingMc.Spec, mc.Spec) || !reflect.DeepEqual(existingMc.Labels, reconciledLabels) {
+		r.Log.Info("MachineConfig changed, updating", "mc.Name", mc.Name)
 		existingMc.Spec = mc.Spec
+		existingMc.Labels = reconciledLabels
 		if err := r.Client.Update(context.TODO(), existingMc); err != nil {
 			r.Log.Error(err, "Failed to update MachineConfig", "mc.Name", mc.Name)
 			return dummy, err
 		}
-		return false, nil
-	} else {
-		r.Log.Info("MachineConfig already exists")
-		return false, nil
+		return true, nil
 	}
+
+	r.Log.Info("MachineConfig already exists")
+	return false, nil
 
 }
 
@@ -1445,16 +1634,23 @@ func (r *KataConfigOpenShiftReconciler) makeReconcileRequest() reconcile.Request
 	}
 }
 
-func isMcpRelevant(mcp client.Object) bool {
+func (r *KataConfigOpenShiftReconciler) isMcpRelevant(mcp client.Object) bool {
 	mcpName := mcp.GetName()
+	if r.usesExternalMachineConfigPool() && mcpName == r.kataConfig.Spec.TargetMachineConfigPool {
+		return true
+	}
 	// TODO Try to find a way to include "master" only if cluster is
 	// converged.  It doesn't seem to hurt to watch it even on regular
 	// clusters as it doesn't really seem to change much there but it
 	// would be cleaner to watch it only when it's actually needed.
-	if mcpName == "kata-oc" || mcpName == "worker" || mcpName == "master" {
+	if mcpName == defaultKataMCPName || mcpName == "worker" || mcpName == "master" {
 		return true
 	}
 	return false
+}
+
+func (r *KataConfigOpenShiftReconciler) isExternalMcpTarget(mcp client.Object) bool {
+	return r.usesExternalMachineConfigPool() && mcp.GetName() == r.kataConfig.Spec.TargetMachineConfigPool
 }
 
 const missingMcpStatusConditionStr = "<missing>"
@@ -1515,7 +1711,7 @@ type McpEventHandler struct {
 func (eh *McpEventHandler) Create(ctx context.Context, event event.CreateEvent, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	mcp := event.Object
 
-	if !isMcpRelevant(mcp) {
+	if !eh.reconciler.isMcpRelevant(mcp) {
 		return
 	}
 
@@ -1524,23 +1720,30 @@ func (eh *McpEventHandler) Create(ctx context.Context, event event.CreateEvent, 
 	// Log the event anyway.
 	log := eh.reconciler.Log.WithName("McpCreate").WithValues("MCP name", mcp.GetName())
 	log.Info("MCP created")
+	if eh.reconciler.kataConfig != nil && eh.reconciler.isExternalMcpTarget(mcp) {
+		queue.Add(eh.reconciler.makeReconcileRequest())
+	}
 }
 
 func (eh *McpEventHandler) Update(ctx context.Context, event event.UpdateEvent, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	mcpOld := event.ObjectOld
 	mcpNew := event.ObjectNew
 
-	if !isMcpRelevant(mcpNew) {
+	if !eh.reconciler.isMcpRelevant(mcpNew) {
 		return
 	}
 
-	statusOld := mcpOld.(*mcfgv1.MachineConfigPool).Status
-	statusNew := mcpNew.(*mcfgv1.MachineConfigPool).Status
-	if reflect.DeepEqual(statusOld, statusNew) {
+	oldPool := mcpOld.(*mcfgv1.MachineConfigPool)
+	newPool := mcpNew.(*mcfgv1.MachineConfigPool)
+	statusOld := oldPool.Status
+	statusNew := newPool.Status
+	externalTargetChanged := eh.reconciler.isExternalMcpTarget(mcpNew) &&
+		(!reflect.DeepEqual(oldPool.Spec, newPool.Spec) || !reflect.DeepEqual(oldPool.Labels, newPool.Labels))
+	if reflect.DeepEqual(statusOld, statusNew) && !externalTargetChanged {
 		return
 	}
 
-	foundRelevantChange := false
+	foundRelevantChange := externalTargetChanged
 
 	if statusOld.MachineCount != statusNew.MachineCount {
 		foundRelevantChange = true
@@ -1584,7 +1787,7 @@ func (eh *McpEventHandler) Update(ctx context.Context, event event.UpdateEvent, 
 func (eh *McpEventHandler) Delete(ctx context.Context, event event.DeleteEvent, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	mcp := event.Object
 
-	if !isMcpRelevant(mcp) {
+	if !eh.reconciler.isMcpRelevant(mcp) {
 		return
 	}
 
@@ -1592,12 +1795,15 @@ func (eh *McpEventHandler) Delete(ctx context.Context, event event.DeleteEvent, 
 	// "kata-oc" should be only deleted by this controller.  Log the event anyway.
 	log := eh.reconciler.Log.WithName("McpDelete").WithValues("MCP name", mcp.GetName())
 	log.Info("MCP deleted")
+	if eh.reconciler.kataConfig != nil && eh.reconciler.isExternalMcpTarget(mcp) {
+		queue.Add(eh.reconciler.makeReconcileRequest())
+	}
 }
 
 func (eh *McpEventHandler) Generic(ctx context.Context, event event.GenericEvent, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) {
 	mcp := event.Object
 
-	if !isMcpRelevant(mcp) {
+	if !eh.reconciler.isMcpRelevant(mcp) {
 		return
 	}
 
@@ -1780,7 +1986,11 @@ func (r *KataConfigOpenShiftReconciler) SetupWithManager(mgr ctrl.Manager) error
 
 func (r *KataConfigOpenShiftReconciler) getNodes() (*corev1.NodeList, error) {
 	nodes := &corev1.NodeList{}
-	labelSelector := labels.SelectorFromSet(map[string]string{"node-role.kubernetes.io/worker": ""})
+	nodeLabels := map[string]string{"node-role.kubernetes.io/worker": ""}
+	if r.usesExternalMachineConfigPool() {
+		nodeLabels = r.getNodeSelectorAsMap()
+	}
+	labelSelector := labels.SelectorFromSet(nodeLabels)
 	listOpts := []client.ListOption{
 		client.MatchingLabelsSelector{Selector: labelSelector},
 	}
@@ -1877,6 +2087,19 @@ func (r *KataConfigOpenShiftReconciler) unlabelNodes(nodeSelector labels.Selecto
 		}
 	}
 	return labelingChanged, nil
+}
+
+func (r *KataConfigOpenShiftReconciler) unlabelKataNodes() (bool, error) {
+	if r.usesExternalMachineConfigPool() {
+		return false, nil
+	}
+
+	kataNodeSelector, err := r.getKataConfigNodeSelectorAsSelector()
+	if err != nil {
+		return false, fmt.Errorf("failed to get node selector for unlabelling nodes: %w", err)
+	}
+
+	return r.unlabelNodes(kataNodeSelector)
 }
 
 //lint:ignore U1000 This method is unused, but let's keep it for now
@@ -1982,13 +2205,21 @@ func isNodeFailedToUninstall(nodeMcoState string, nodeCurrMc string, nodeTargetM
 }
 
 func (r *KataConfigOpenShiftReconciler) putNodeOnStatusList(node *corev1.Node) error {
+	usesExternalMachineConfigPool := r.usesExternalMachineConfigPool()
 
-	isConvergedCluster, err := r.checkConvergedCluster()
-	if err != nil {
-		return err
+	isConvergedCluster := false
+	if !usesExternalMachineConfigPool {
+		var err error
+		isConvergedCluster, err = r.checkConvergedCluster()
+		if err != nil {
+			return err
+		}
 	}
 
 	targetMcpName := func() string {
+		if usesExternalMachineConfigPool {
+			return r.kataConfig.Spec.TargetMachineConfigPool
+		}
 		if isConvergedCluster {
 			return "master"
 		}
@@ -2025,21 +2256,25 @@ func (r *KataConfigOpenShiftReconciler) putNodeOnStatusList(node *corev1.Node) e
 	// will belong to shortly.
 	nodeTargetMc := targetMcp.Spec.Configuration.Name
 
-	// `isKataEnabledOnNode` is a per Node condition on regular clusters
-	// but cluster-wide on converged ones.
+	// `isKataEnabledOnNode` is a per Node condition on regular managed-pool
+	// clusters but pool-wide on external and converged pools.
 	// On regular clusters, this is ultimately determined by
 	// KataConfig.spec.kataConfigPoolSelector (we use the
 	// node-role.kubernetes.io/kata-oc to find this above in this function,
 	// and the node-role is in turn assigned to Nodes based on the pool
 	// selector).
-	// On converged clusters, basically only two operations are possible:
+	// On an external pool, the presence of an OSC MachineConfig in the pool's
+	// desired sources determines whether Kata is enabled. On converged clusters,
+	// basically only two operations are possible:
 	// installing kata on all masters and uninstalling kata from all
 	// masters, no per-Node options can be supported.  We find if kata is
 	// supposed to be installed on the cluster by examining the "master"
 	// MCP's MachineConfig to see if it installs the kata containers
 	// extension.
 	var isKataEnabledOnNode bool
-	if isConvergedCluster {
+	if usesExternalMachineConfigPool {
+		isKataEnabledOnNode = machineConfigPoolIncludesKataMachineConfig(targetMcp)
+	} else if isConvergedCluster {
 		targetMc := &mcfgv1.MachineConfig{}
 		err := r.Client.Get(context.TODO(), types.NamespacedName{Name: targetMcp.Spec.Configuration.Name}, targetMc)
 		if err != nil {
@@ -2170,6 +2405,44 @@ func (r *KataConfigOpenShiftReconciler) setInProgressConditionToUpdating() {
 	cond.Message = "Adding and/or removing kata-enabled nodes"
 
 	r.Log.Info("InProgress Condition set to Updating")
+}
+
+const (
+	targetMcpNotFoundReason = "TargetMachineConfigPoolNotFound"
+	targetMcpNotReadyReason = "TargetMachineConfigPoolNotReady"
+)
+
+func (r *KataConfigOpenShiftReconciler) setInProgressConditionToTargetMcpNotReady(machinePool string, err error) bool {
+	reason := targetMcpNotReadyReason
+	message := fmt.Sprintf("Target MachineConfigPool %q is not ready: %v", machinePool, err)
+	if k8serrors.IsNotFound(err) {
+		reason = targetMcpNotFoundReason
+		message = fmt.Sprintf("Target MachineConfigPool %q was not found", machinePool)
+	}
+
+	cond := r.findInProgressCondition()
+	if cond != nil && cond.Status == corev1.ConditionTrue && cond.Reason == reason && cond.Message == message {
+		return false
+	}
+
+	cond = r.retrieveInProgressConditionForChange()
+	cond.Status = corev1.ConditionTrue
+	cond.Reason = reason
+	cond.Message = message
+
+	r.Log.Info("InProgress Condition set for target MachineConfigPool failure", "machinePool", machinePool, "reason", reason)
+	return true
+}
+
+func (r *KataConfigOpenShiftReconciler) recoverFromTargetMcpFailure() bool {
+	cond := r.findInProgressCondition()
+	if cond == nil || cond.Status != corev1.ConditionTrue ||
+		(cond.Reason != targetMcpNotFoundReason && cond.Reason != targetMcpNotReadyReason) {
+		return false
+	}
+
+	r.setInProgressConditionToInstalling()
+	return true
 }
 
 func (r *KataConfigOpenShiftReconciler) setInProgressConditionToFailed(failingNode *corev1.Node) {
