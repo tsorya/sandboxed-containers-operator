@@ -125,9 +125,34 @@ spec:
                 description: Sets log level on kata-equipped nodes.  Valid values
                   are the same as for `crio --log-level`.
                 type: string
+              targetMachineConfigPool:
+                description: |-
+                  TargetMachineConfigPool is the name of an existing, externally managed
+                  MachineConfigPool on which Kata will be installed. The pool must select
+                  MachineConfigs whose machineconfiguration.openshift.io/role label equals
+                  the pool name, and its nodes must have the corresponding
+                  node-role.kubernetes.io/<pool-name> label. When set, the operator does not
+                  create or delete a MachineConfigPool and does not change node role labels.
+                  This field requires MachineConfig deployment mode, is immutable, and is
+                  mutually exclusive with KataConfigPoolSelector and CheckNodeEligibility.
+                maxLength: 63
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                type: string
             required:
             - checkNodeEligibility
             type: object
+            x-kubernetes-validations:
+            - message: targetMachineConfigPool and kataConfigPoolSelector are mutually
+                exclusive
+              rule: '!has(self.targetMachineConfigPool) || !has(self.kataConfigPoolSelector)
+                || self.kataConfigPoolSelector == null'
+            - message: targetMachineConfigPool and checkNodeEligibility are mutually
+                exclusive
+              rule: '!has(self.targetMachineConfigPool) || !self.checkNodeEligibility'
+            - message: targetMachineConfigPool is immutable
+              rule: '!has(oldSelf.targetMachineConfigPool) ? !has(self.targetMachineConfigPool)
+                : has(self.targetMachineConfigPool) && self.targetMachineConfigPool
+                == oldSelf.targetMachineConfigPool'
           status:
             description: KataConfigStatus defines the observed state of KataConfig
             properties:

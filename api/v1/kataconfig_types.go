@@ -22,12 +22,28 @@ import (
 // NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
 
 // KataConfigSpec defines the desired state of KataConfig
+// +kubebuilder:validation:XValidation:rule="!has(self.targetMachineConfigPool) || !has(self.kataConfigPoolSelector) || self.kataConfigPoolSelector == null",message="targetMachineConfigPool and kataConfigPoolSelector are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="!has(self.targetMachineConfigPool) || !self.checkNodeEligibility",message="targetMachineConfigPool and checkNodeEligibility are mutually exclusive"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.targetMachineConfigPool) ? !has(self.targetMachineConfigPool) : has(self.targetMachineConfigPool) && self.targetMachineConfigPool == oldSelf.targetMachineConfigPool",message="targetMachineConfigPool is immutable"
 type KataConfigSpec struct {
 	// KataConfigPoolSelector is used to filter the worker nodes
 	// if not specified, all worker nodes are selected
 	// +optional
 	// +nullable
 	KataConfigPoolSelector *metav1.LabelSelector `json:"kataConfigPoolSelector"`
+
+	// TargetMachineConfigPool is the name of an existing, externally managed
+	// MachineConfigPool on which Kata will be installed. The pool must select
+	// MachineConfigs whose machineconfiguration.openshift.io/role label equals
+	// the pool name, and its nodes must have the corresponding
+	// node-role.kubernetes.io/<pool-name> label. When set, the operator does not
+	// create or delete a MachineConfigPool and does not change node role labels.
+	// This field requires MachineConfig deployment mode, is immutable, and is
+	// mutually exclusive with KataConfigPoolSelector and CheckNodeEligibility.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	TargetMachineConfigPool string `json:"targetMachineConfigPool,omitempty"`
 
 	// CheckNodeEligibility is used to detect the node(s) eligibility to run Kata containers.
 	// This is currently done through the use of the Node Feature Discovery Operator (NFD).

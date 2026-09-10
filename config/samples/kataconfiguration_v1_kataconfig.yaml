@@ -3,6 +3,10 @@ kind: KataConfig
 metadata:
   name: example-kataconfig
 #spec:
+#  # Install Kata on an existing, externally managed MachineConfigPool.
+#  # This cannot be combined with kataConfigPoolSelector or checkNodeEligibility.
+#  targetMachineConfigPool: worker-dpu
+#
 #  kataConfigPoolSelector:
 #    matchLabels:
 #       custom-kata1: test 
